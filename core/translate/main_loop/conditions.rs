@@ -14,7 +14,9 @@ fn subquery_referenced_in_predicates(
 ) -> bool {
     predicates
         .iter()
-        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == outer_join_terms)
+        .filter(|cond| {
+            cond.origin.join_origin().is_some_and(JoinOrigin::is_outer) == outer_join_terms
+        })
         .any(|cond| expr_references_subquery_id(&cond.expr, subquery_id))
 }
 
@@ -65,7 +67,9 @@ fn emit_conditions(
 ) -> Result<()> {
     for cond in predicates
         .iter()
-        .filter(|cond| cond.from_join.is_some_and(JoinOrigin::is_outer) == outer_join_terms)
+        .filter(|cond| {
+            cond.origin.join_origin().is_some_and(JoinOrigin::is_outer) == outer_join_terms
+        })
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
         })

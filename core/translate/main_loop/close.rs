@@ -3,8 +3,9 @@ use crate::translate::main_loop::hash::{
     emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
 use crate::translate::main_loop::open::{
-    emit_materialized_subquery_result_columns, emit_right_join_key,
+    emit_materialized_subquery_result_columns, emit_right_join_key, emit_virtual_table_scan_start,
 };
+use crate::translate::subquery::emit_non_from_clause_subquery;
 
 /// Set every source left of a right-preserving join to its NULL-row state.
 ///
@@ -53,7 +54,7 @@ fn emit_null_row_for_source(
 
 /// Emit each right-side row that the main join loop did not match.
 ///
-/// Table-backed sources use their unmatched-right read and check the stored rowid set.
+/// Restartable sources use their unmatched-right read and check the stored rowid set.
 /// A recursive CTE exposes only its current pseudo-row, so it uses a direct check.
 fn emit_unmatched_right_rows(
     program: &mut ProgramBuilder,
@@ -92,11 +93,18 @@ fn emit_unmatched_right_rows(
     }
 
     // A source without a separate operation uses its default scan.
-    let unmatched_rows_operation = main_table
-        .unmatched_right_rows_operation
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| Operation::default_scan_for(&main_table.table));
+    let UnmatchedRightRowsPlan {
+        operation: mut unmatched_rows_operation,
+        subqueries: mut unmatched_rows_subqueries,
+        conditions: mut unmatched_rows_conditions,
+    } = main_table
+        .unmatched_right_rows_plan
+        .clone()
+        .unwrap_or_else(|| UnmatchedRightRowsPlan {
+            operation: Operation::default_scan_for(&main_table.table),
+            subqueries: Vec::new(),
+            conditions: Vec::new(),
+        });
 
     // Result expressions already refer to the main index cursor. SQLite leaves
     // that cursor null while its separate right-side read uses another cursor.
@@ -180,11 +188,18 @@ fn emit_unmatched_right_rows(
                 });
             }
         }
+        Table::Virtual(_) => {
+            // SQLite opens a new virtual cursor because the main loop leaves
+            // the first cursor at its end.
+            program.emit_insn(Insn::VOpen {
+                cursor_id: table_cursor_id,
+            });
+        }
         Table::FromClauseSubquery(subquery) if subquery.materialized_cursor_id.is_some() => {}
         _ => {
-            // Turso cannot yet restart a coroutine or virtual table for this pass.
+            // Turso cannot restart a coroutine for this pass.
             return Err(crate::LimboError::InternalError(
-                "right-preserving joins need a table-backed right source".to_string(),
+                "right-preserving joins need a restartable right source".to_string(),
             ));
         }
     }
@@ -192,6 +207,43 @@ fn emit_unmatched_right_rows(
     let scan_end = program.allocate_label();
     let next_row = program.allocate_label();
     let emit_row = program.allocate_label();
+
+    for subquery in &mut unmatched_rows_subqueries {
+        let query_type = assign_new_subquery_output(program, subquery);
+        let Operation::Scan(Scan::VirtualTable { constraints, .. }) = &mut unmatched_rows_operation
+        else {
+            unreachable!("only a virtual-table plan can copy table-function subqueries");
+        };
+        for expr in constraints
+            .iter_mut()
+            .chain(unmatched_rows_conditions.iter_mut())
+        {
+            walk_expr_mut(expr, &mut |expr| {
+                if let Expr::SubqueryResult {
+                    subquery_id,
+                    query_type: expr_query_type,
+                    ..
+                } = expr
+                {
+                    if *subquery_id == subquery.internal_id {
+                        *expr_query_type = query_type.clone();
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
+        let subquery_plan = subquery.consume_plan(EvalAt::Loop(table_index));
+        program.with_cursor_overrides(&cursor_overrides, |program| {
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+                false,
+            )
+        })?;
+    }
 
     match &unmatched_rows_operation {
         Operation::Scan(Scan::BTreeTable { iter_dir, .. }) => {
@@ -228,6 +280,25 @@ fn emit_unmatched_right_rows(
                 });
             }
             program.preassign_label_to_next_insn(scan_start);
+        }
+        Operation::Scan(Scan::VirtualTable {
+            idx_num,
+            idx_str,
+            constraints,
+        }) => {
+            program.with_cursor_overrides(&cursor_overrides, |program| {
+                emit_virtual_table_scan_start(
+                    program,
+                    tables,
+                    &t_ctx.resolver,
+                    table_cursor_id,
+                    *idx_num,
+                    idx_str.as_deref(),
+                    constraints,
+                    scan_start,
+                    scan_end,
+                )
+            })?;
         }
         Operation::Search(Search::RowidEq { cmp_expr }) => {
             let src_reg = program.alloc_register();
@@ -305,6 +376,27 @@ fn emit_unmatched_right_rows(
         }
     }
 
+    // SQLite checks table-function arguments that xBestIndex did not mark
+    // omitted before it looks for the row in the matched-row set.
+    for condition in &unmatched_rows_conditions {
+        let condition_is_true = program.allocate_label();
+        program.with_cursor_overrides(&cursor_overrides, |program| {
+            translate_condition_expr(
+                program,
+                tables,
+                condition,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: condition_is_true,
+                    jump_target_when_false: next_row,
+                    jump_target_when_null: next_row,
+                },
+                &t_ctx.resolver,
+            )
+        })?;
+        program.preassign_label_to_next_insn(condition_is_true);
+    }
+
     emit_right_join_key(program, right_join, table_cursor_id, index_cursor_id);
     // The bloom filter can skip most exact lookups. It never decides that a row matched.
     program.emit_insn(Insn::Filter {
@@ -376,6 +468,12 @@ fn emit_unmatched_right_rows(
                 .map(|_| index_cursor_id.expect("an indexed IN search needs a cursor"));
             emit_in_seek_end(program, matching_rows_cursor_id, scan_start, meta);
         }
+        Operation::Scan(Scan::VirtualTable { .. }) => {
+            program.emit_insn(Insn::VNext {
+                cursor_id: table_cursor_id,
+                pc_if_next: scan_start,
+            });
+        }
         Operation::MultiIndexScan(_) => {
             // `RowSetRead` advances this operation, so the jump resumes it.
             program.emit_insn(Insn::Goto {
@@ -386,6 +484,73 @@ fn emit_unmatched_right_rows(
     }
     program.preassign_label_to_next_insn(scan_end);
     Ok(())
+}
+
+/// Give a copied table-function argument subquery its own output storage.
+///
+/// SQLite gives the copied subquery new result storage. Separate storage prevents
+/// this read from changing a value that a later unmatched read needs.
+fn assign_new_subquery_output(
+    program: &mut ProgramBuilder,
+    subquery: &mut NonFromClauseSubquery,
+) -> SubqueryType {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &mut subquery.state else {
+        panic!("a copied table-function subquery must keep its plan");
+    };
+    let query_type = match &subquery.query_type {
+        SubqueryType::Exists { .. } => {
+            let result_reg = program.alloc_register();
+            *plan
+                .select_query_destination_mut()
+                .expect("a subquery must have a query destination") =
+                QueryDestination::ExistsSubqueryResult { result_reg };
+            SubqueryType::Exists { result_reg }
+        }
+        SubqueryType::RowValue { num_regs, .. } => {
+            let result_reg_start = program.alloc_registers(*num_regs);
+            *plan
+                .select_query_destination_mut()
+                .expect("a subquery must have a query destination") =
+                QueryDestination::RowValueSubqueryResult {
+                    result_reg_start,
+                    num_regs: *num_regs,
+                };
+            SubqueryType::RowValue {
+                result_reg_start,
+                num_regs: *num_regs,
+            }
+        }
+        SubqueryType::In { affinity_str, .. } => {
+            let (index, destination_affinity, is_delete) = match plan
+                .select_query_destination()
+                .expect("a subquery must have a query destination")
+            {
+                QueryDestination::EphemeralIndex {
+                    index,
+                    affinity_str,
+                    is_delete,
+                    ..
+                } => (index.clone(), affinity_str.clone(), *is_delete),
+                _ => panic!("an IN subquery must write to an ephemeral index"),
+            };
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            *plan
+                .select_query_destination_mut()
+                .expect("a subquery must have a query destination") =
+                QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index,
+                    affinity_str: destination_affinity,
+                    is_delete,
+                };
+            SubqueryType::In {
+                cursor_id,
+                affinity_str: affinity_str.clone(),
+            }
+        }
+    };
+    subquery.query_type = query_type.clone();
+    query_type
 }
 
 /// Represents final step of Loop emission
