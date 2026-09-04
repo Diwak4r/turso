@@ -15,7 +15,7 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            JoinOrigin, Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
             SimpleAggregate,
         },
         planner::table_mask_from_expr,
@@ -603,9 +603,9 @@ fn prune_join_order_for_materialized_inputs(
         if term.consumed {
             continue;
         }
-        if term.from_outer_join.is_some() {
+        if term.from_join.is_some_and(JoinOrigin::is_outer) {
             // OUTER JOIN terms still belong to the right-table loop recorded in
-            // `from_outer_join`. Materializing and pruning the build-side prefix
+            // `from_join`. Materializing and pruning the build-side prefix
             // does not make those terms safe to consume here, because the
             // materialization subplan does not include the probe table that
             // determines the null-extension boundary.

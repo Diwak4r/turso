@@ -23,14 +23,18 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
-        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
+        eqp::{
+            eqp_detail_for_table_op, eqp_details_for_right_join, EqpDetail, EqpJoin, EqpSubquery,
+            EqpSubqueryExec,
+        },
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
-            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
-            JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryEvalPhase,
-            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
+            JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
+            WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -1374,7 +1378,12 @@ fn eqp_subquery_info(
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    keeps_right_rows: bool,
 ) -> FromClauseSubqueryExecutionMode {
+    if keeps_right_rows {
+        return FromClauseSubqueryExecutionMode::MaterializedTable;
+    }
+
     let needs_materialized_seek = matches!(
         operation,
         Operation::Search(Search::Seek {
@@ -1454,6 +1463,10 @@ pub fn emit_from_clause_subqueries(
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
+                    table_reference
+                        .join_info
+                        .as_ref()
+                        .is_some_and(JoinInfo::keeps_right_rows),
                 ))
             }
             _ => None,
@@ -1587,6 +1600,19 @@ pub fn emit_from_clause_subqueries(
 
         program.pop_current_parent_explain();
     }
+
+    for table in tables.joined_tables() {
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+        {
+            let (right_join, scan) = eqp_details_for_right_join(table);
+            emit_explain!(program, true, right_join);
+            emit_explain!(program, false, scan);
+            program.pop_current_parent_explain();
+        }
+    }
     Ok(())
 }
 
@@ -1659,6 +1685,9 @@ pub fn emit_from_clause_subquery(
                     label_main_loop_end: None,
                     meta_group_by: None,
                     meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_right_joins: (0..select_plan.joined_tables().len())
                         .map(|_| None)
                         .collect(),
                     meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -1756,6 +1785,9 @@ fn emit_indexed_materialized_subquery(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -1869,6 +1901,9 @@ fn emit_materialized_subquery_table(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())
